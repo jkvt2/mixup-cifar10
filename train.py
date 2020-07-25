@@ -38,6 +38,8 @@ parser.add_argument('--no-augment', dest='augment', action='store_false',
 parser.add_argument('--decay', default=1e-4, type=float, help='weight decay')
 parser.add_argument('--alpha', default=1., type=float,
                     help='mixup interpolation coefficient (default: 1)')
+parser.add_argument('--n_mix', default=2, type=int,
+                    help='number of examples to mix together (default: 2)')
 args = parser.parse_args()
 
 use_cuda = torch.cuda.is_available()
@@ -71,13 +73,13 @@ transform_test = transforms.Compose([
     transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
 ])
 
-trainset = datasets.CIFAR10(root='~/data', train=True, download=False,
+trainset = datasets.CIFAR10(root='../data', train=True, download=False,
                             transform=transform_train)
 trainloader = torch.utils.data.DataLoader(trainset,
                                           batch_size=args.batch_size,
                                           shuffle=True, num_workers=8)
 
-testset = datasets.CIFAR10(root='~/data', train=False, download=False,
+testset = datasets.CIFAR10(root='../data', train=False, download=False,
                            transform=transform_test)
 testloader = torch.utils.data.DataLoader(testset, batch_size=100,
                                          shuffle=False, num_workers=8)
@@ -116,27 +118,35 @@ optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9,
                       weight_decay=args.decay)
 
 
-def mixup_data(x, y, alpha=1.0, use_cuda=True):
+def mixup_data(x, y, alpha=1.0, n_mix=2, use_cuda=True):
     '''Returns mixed inputs, pairs of targets, and lambda'''
-    if alpha > 0:
-        lam = np.random.beta(alpha, alpha)
-    else:
-        lam = 1
-
     batch_size = x.size()[0]
-    if use_cuda:
-        index = torch.randperm(batch_size).cuda()
+
+    if n_mix >= 2:
+        if alpha > 0:
+            lam = np.random.dirichlet(alpha * np.ones(n_mix))
+        else:
+            lam = np.zeros(n_mix)
+            lam[0] = 1.0
     else:
-        index = torch.randperm(batch_size)
+        raise ValueError('n_mix must be 2 or larger')
 
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
+    mixed_y = [y]
+    mixed_x = lam[0] * x
+    for i in range(1, n_mix):
+        if use_cuda:
+            index = torch.randperm(batch_size).cuda()
+        else:
+            index = torch.randperm(batch_size)
+    
+        mixed_x += lam[i] * x[index, :]
+        mixed_y += [y[index]]
+
+    return mixed_x, mixed_y, lam
 
 
-def mixup_criterion(criterion, pred, y_a, y_b, lam):
-    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
-
+def mixup_criterion(criterion, pred, ys, lam):
+    return sum([l * criterion(pred, y) for l, y in zip(lam, ys)])
 
 def train(epoch):
     print('\nEpoch: %d' % epoch)
@@ -149,17 +159,21 @@ def train(epoch):
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda()
 
-        inputs, targets_a, targets_b, lam = mixup_data(inputs, targets,
-                                                       args.alpha, use_cuda)
-        inputs, targets_a, targets_b = map(Variable, (inputs,
-                                                      targets_a, targets_b))
-        outputs = net(inputs)
-        loss = mixup_criterion(criterion, outputs, targets_a, targets_b, lam)
-        train_loss += loss.data[0]
+        mixed_inputs, mixed_targets, lam = mixup_data(
+            x=inputs,
+            y=targets,
+            alpha=args.alpha,
+            n_mix=args.n_mix,
+            use_cuda=use_cuda)
+        mixed_inputs = Variable(mixed_inputs)
+        mixed_targets = list(map(Variable, mixed_targets))
+        outputs = net(mixed_inputs)
+        loss = mixup_criterion(criterion, outputs, mixed_targets, lam)
+        train_loss += loss.item()
         _, predicted = torch.max(outputs.data, 1)
         total += targets.size(0)
-        correct += (lam * predicted.eq(targets_a.data).cpu().sum().float()
-                    + (1 - lam) * predicted.eq(targets_b.data).cpu().sum().float())
+        correct += sum([l * predicted.eq(t.data).cpu().sum().item() \
+                        for l, t in zip(lam, mixed_targets)])
 
         optimizer.zero_grad()
         loss.backward()
@@ -185,10 +199,10 @@ def test(epoch):
         outputs = net(inputs)
         loss = criterion(outputs, targets)
 
-        test_loss += loss.data[0]
+        test_loss += loss.item()
         _, predicted = torch.max(outputs.data, 1)
         total += targets.size(0)
-        correct += predicted.eq(targets.data).cpu().sum()
+        correct += predicted.eq(targets.data).cpu().sum().item()
 
         progress_bar(batch_idx, len(testloader),
                      'Loss: %.3f | Acc: %.3f%% (%d/%d)'
@@ -226,7 +240,6 @@ def adjust_learning_rate(optimizer, epoch):
         lr /= 10
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-
 
 if not os.path.exists(logname):
     with open(logname, 'w') as logfile:
